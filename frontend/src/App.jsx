@@ -1,7 +1,11 @@
 import React, { useState, useEffect } from 'react';
 
 // Common global API base
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api/v1';
+let tempApiBase = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api/v1';
+if (tempApiBase && !tempApiBase.startsWith('http://') && !tempApiBase.startsWith('https://')) {
+  tempApiBase = `https://${tempApiBase}/api/v1`;
+}
+const API_BASE = tempApiBase;
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');

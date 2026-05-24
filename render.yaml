@@ -28,8 +28,7 @@ services:
         fromService:
           type: web
           name: breathe-esg-backend
-          property: url
-          suffix: /api/v1
+          property: host
     routes:
       - type: rewrite
         source: /*
