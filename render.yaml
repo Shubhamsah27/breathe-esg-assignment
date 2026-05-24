@@ -18,8 +18,9 @@ services:
         value: "True"
 
   # 2. Vite React Frontend Static Site
-  - type: static
+  - type: web
     name: breathe-esg-frontend
+    env: static
     buildCommand: "cd frontend && npm install && npm run build"
     staticPublishPath: "frontend/dist"
     envVars:
