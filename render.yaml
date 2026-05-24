@@ -3,12 +3,9 @@ services:
   - type: web
     name: breathe-esg-backend
     env: python
+    plan: free  # Selects Render's Free plan (no credit card required)
     buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --noinput && python manage.py migrate"
     startCommand: "gunicorn breathe_esg.wsgi:application"
-    disk:
-      name: sqlite-db-disk
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.5
