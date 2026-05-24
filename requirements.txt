@@ -1,0 +1,8 @@
+django>=5.0
+djangorestframework
+django-cors-headers
+gunicorn
+whitenoise
+sqlparse
+tzdata
+asgiref

@@ -1,0 +1,36 @@
+services:
+  # 1. Django Backend Web Service
+  - type: web
+    name: breathe-esg-backend
+    env: python
+    buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --noinput && python manage.py migrate"
+    startCommand: "gunicorn breathe_esg.wsgi:application"
+    disk:
+      name: sqlite-db-disk
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: ALLOWED_HOSTS
+        value: "*"
+      - key: DEBUG
+        value: "True"
+
+  # 2. Vite React Frontend Static Site
+  - type: web
+    name: breathe-esg-frontend
+    env: static
+    buildCommand: "cd frontend && npm install && npm run build"
+    publishDir: "frontend/dist"
+    envVars:
+      - key: VITE_API_BASE
+        fromService:
+          type: web
+          name: breathe-esg-backend
+          property: url
+          suffix: /api/v1
+    routes:
+      - type: rewrite
+        src: /*
+        dest: /index.html
