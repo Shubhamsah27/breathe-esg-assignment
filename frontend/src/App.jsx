@@ -47,6 +47,16 @@ export default function App() {
   const [utilityFile, setUtilityFile] = useState(null);
   const [uploadMessage, setUploadMessage] = useState({ text: '', isError: false });
 
+  // Optimization States
+  const [failedRecords, setFailedRecords] = useState([]);
+  const [selectedFailedRecord, setSelectedFailedRecord] = useState(null);
+  const [failedRecordCorrectionData, setFailedRecordCorrectionData] = useState({});
+  const [showPlantRegisterForm, setShowPlantRegisterForm] = useState(false);
+  const [newPlantName, setNewPlantName] = useState('');
+  const [newPlantRegion, setNewPlantRegion] = useState('DE');
+  const [plantCodeToRegister, setPlantCodeToRegister] = useState('');
+
+
   // Initial Seed check
   useEffect(() => {
     // Attempt auto-connect and seed if first start
@@ -122,6 +132,12 @@ export default function App() {
       if (recRes.ok) {
         const recs = await recRes.json();
         setRecords(recs);
+      }
+      // 3. Fetch Sandboxed Ingest Errors
+      const rawRes = await fetch(`${API_BASE}/raw-records/?organization=${orgId}&status=FAILED_VALIDATION`);
+      if (rawRes.ok) {
+        const raws = await rawRes.json();
+        setFailedRecords(raws);
       }
     } catch (e) {
       console.error("Error refreshing dashboard data", e);
@@ -330,6 +346,82 @@ export default function App() {
     }
   };
 
+  // Register Plant Lookup and trigger Bulk Recalculation
+  const handleRegisterPlantSubmit = async (e) => {
+    e.preventDefault();
+    if (!plantCodeToRegister.trim() || !newPlantName.trim() || !newPlantRegion.trim()) return;
+
+    try {
+      setLoading(true);
+      // 1. Create the PlantLookup
+      const plantRes = await fetch(`${API_BASE}/plants/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          organization: orgId,
+          plant_code: plantCodeToRegister.trim(),
+          name: newPlantName.trim(),
+          region: newPlantRegion.trim()
+        })
+      });
+      const plantData = await plantRes.json();
+      if (!plantRes.ok) {
+        throw new Error(JSON.stringify(plantData) || "Failed to create plant lookup");
+      }
+
+      // 2. Trigger bulk retroactive recalculation for matching records
+      const recalcRes = await fetch(`${API_BASE}/records/recalculate_for_plant/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          organization: orgId,
+          plant_code: plantCodeToRegister.trim()
+        })
+      });
+      const recalcData = await recalcRes.json();
+      if (!recalcRes.ok) throw new Error(recalcData.error || "Failed to trigger retroactive emissions recalculation");
+
+      alert(`Plant registered successfully! ${recalcData.message}`);
+      setShowPlantRegisterForm(false);
+      setNewPlantName('');
+      closeDrawer();
+      refreshData();
+    } catch (err) {
+      alert(`Registration/Recalculation error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Correct Malformed Ingestion Row Sandbox
+  const handleRetrySandboxSubmit = async (e) => {
+    e.preventDefault();
+    if (!selectedFailedRecord) return;
+
+    try {
+      setLoading(true);
+      const res = await fetch(`${API_BASE}/raw-records/${selectedFailedRecord.id}/retry_ingest/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          raw_data: failedRecordCorrectionData
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Sandbox retry ingestion failed");
+
+      alert("Correction applied and row successfully processed!");
+      setSelectedFailedRecord(null);
+      setFailedRecordCorrectionData({});
+      refreshData();
+    } catch (err) {
+      alert(`Validation error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
   const openDrawer = (rec) => {
     setSelectedRecord(rec);
     setDrawerOpen(true);
@@ -349,6 +441,17 @@ export default function App() {
            r.activity_type.toLowerCase().includes(q) ||
            (r.suspicious_reason && r.suspicious_reason.toLowerCase().includes(q));
   });
+
+  const totalRecs = records.length;
+  const auditedCount = records.filter(r => r.status === 'AUDITED').length;
+  const approvedCount = records.filter(r => r.status === 'APPROVED').length;
+  const draftCount = records.filter(r => r.status === 'DRAFT').length;
+  const suspiciousCount = records.filter(r => r.status === 'SUSPICIOUS').length;
+  
+  const rawScore = totalRecs > 0 
+    ? (auditedCount * 100 + approvedCount * 80 + draftCount * 50 - suspiciousCount * 20) / totalRecs
+    : 100;
+  const dataQualityScore = Math.max(0, Math.min(100, Math.round(rawScore)));
 
   return (
     <div style={{ display: 'flex', width: '100%' }}>
@@ -480,6 +583,21 @@ export default function App() {
                       Flights (Haversine), hotels, ground
                     </div>
                   </div>
+
+                  <div className="metric-card" style={{ display: 'flex', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', border: '1px solid rgba(16, 185, 129, 0.2)', minWidth: '240px' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <span className="metric-label" style={{ color: 'var(--status-approved)' }}>Ledger Integrity</span>
+                      <div className="metric-value" style={{ fontSize: '28px', color: 'var(--text-primary)' }}>
+                        {dataQualityScore}%
+                      </div>
+                      <div className="metric-trend" style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                        Based on audits, overrides & anomalies
+                      </div>
+                    </div>
+                    <div className="scorecard-circle" style={{ background: `conic-gradient(var(--status-approved) ${dataQualityScore}%, var(--border-subtle) 0)` }}>
+                      <span className="scorecard-value">{dataQualityScore}%</span>
+                    </div>
+                  </div>
                 </div>
 
                 {/* Dashboard Charts */}
@@ -587,92 +705,184 @@ export default function App() {
 
             {/* TAB: INGEST CENTER */}
             {activeTab === 'ingest' && (
-              <div className="ingestion-panel">
-                {/* SAP File & Utility File Uploader */}
-                <div className="upload-card">
-                  <div className="chart-title">
-                    <h2>CSV File Ingestion Pipeline</h2>
-                    <p>Ingest raw SAP Procurement materials or Utility Portal bill CSVs</p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '32px', width: '100%' }}>
+                <div className="ingestion-panel">
+                  {/* SAP File & Utility File Uploader */}
+                  <div className="upload-card">
+                    <div className="chart-title">
+                      <h2>CSV File Ingestion Pipeline</h2>
+                      <p>Ingest raw SAP Procurement materials or Utility Portal bill CSVs</p>
+                    </div>
+                    
+                    <div className="card-instructions">
+                      Ingested records are automatically passed through raw validation parsers, resolving plant locations and splitting multi-month utility bill periods proportionally into individual calendar months.
+                    </div>
+
+                    {/* SAP uploader */}
+                    <form onSubmit={handleUploadSAP} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--scope1)' }}>SOURCE A: SAP FUEL & PROCUREMENT EXPORT</div>
+                      <div className="dropzone" style={{ position: 'relative' }}>
+                        <input 
+                          type="file" 
+                          accept=".csv"
+                          onChange={(e) => setSapFile(e.target.files[0])}
+                          style={{ position: 'absolute', opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }}
+                        />
+                        <span className="dropzone-icon">📁</span>
+                        <div className="dropzone-text">{sapFile ? sapFile.name : "Select or drag SAP CSV export file"}</div>
+                        <div className="dropzone-subtext">Must contain plant WERKS, posting date BUDAT, description TXT50, quantity MENGE</div>
+                      </div>
+                      {sapFile && <button type="submit" className="btn btn-primary" style={{ width: '100%' }} disabled={loading}>Process SAP Export</button>}
+                    </form>
+
+                    {/* Utility uploader */}
+                    <form onSubmit={handleUploadUtility} style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '16px' }}>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--scope2)' }}>SOURCE B: ELECTRICITY UTILITY BILL CSV</div>
+                      <div className="dropzone" style={{ position: 'relative' }}>
+                        <input 
+                          type="file" 
+                          accept=".csv"
+                          onChange={(e) => setUtilityFile(e.target.files[0])}
+                          style={{ position: 'absolute', opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }}
+                        />
+                        <span className="dropzone-icon">⚡</span>
+                        <div className="dropzone-text">{utilityFile ? utilityFile.name : "Select or drag Utility Billing CSV file"}</div>
+                        <div className="dropzone-subtext">Must contain Bill Start Date, Bill End Date, Consumption, Account Number</div>
+                      </div>
+                      {utilityFile && <button type="submit" className="btn btn-primary" style={{ width: '100%' }} disabled={loading}>Process Utility Bill</button>}
+                    </form>
+
+                    {/* Sample content generator */}
+                    <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      <div className="detail-label">Need Test Files?</div>
+                      <div className="sample-downloader">
+                        <span>SAP Fuel Sample Export (with anomalies)</span>
+                        <a href="#" className="link-action" onClick={(e) => { e.preventDefault(); downloadCSV('sap'); }}>Download CSV</a>
+                      </div>
+                      <div className="sample-downloader">
+                        <span>Utility billing calendar-spanning sample</span>
+                        <a href="#" className="link-action" onClick={(e) => { e.preventDefault(); downloadCSV('utility'); }}>Download CSV</a>
+                      </div>
+                    </div>
                   </div>
-                  
-                  <div className="card-instructions">
-                    Ingested records are automatically passed through raw validation parsers, resolving plant locations and splitting multi-month utility bill periods proportionally into individual calendar months.
-                  </div>
 
-                  {/* SAP uploader */}
-                  <form onSubmit={handleUploadSAP} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--scope1)' }}>SOURCE A: SAP FUEL & PROCUREMENT EXPORT</div>
-                    <div className="dropzone" style={{ position: 'relative' }}>
-                      <input 
-                        type="file" 
-                        accept=".csv"
-                        onChange={(e) => setSapFile(e.target.files[0])}
-                        style={{ position: 'absolute', opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }}
+                  {/* API Console Simulator */}
+                  <div className="upload-card">
+                    <div className="chart-title">
+                      <h2>Corporate Travel API Simulator</h2>
+                      <p>Copy-paste JSON expense records for Concur or Navan API ingestion</p>
+                    </div>
+                    
+                    <div className="card-instructions">
+                      Travel platform items map flights, hotel stays, and ground transport. Flight distances are dynamically calculated using **Haversine formula coordinate math** for airport codes.
+                    </div>
+
+                    <div className="console-container">
+                      <textarea 
+                        className="console-editor"
+                        value={jsonInput}
+                        onChange={(e) => setJsonInput(e.target.value)}
                       />
-                      <span className="dropzone-icon">📁</span>
-                      <div className="dropzone-text">{sapFile ? sapFile.name : "Select or drag SAP CSV export file"}</div>
-                      <div className="dropzone-subtext">Must contain plant WERKS, posting date BUDAT, description TXT50, quantity MENGE</div>
+                      <div className="console-presets">
+                        <button className="preset-btn" onClick={() => setJsonInput(JSON.stringify(sampleTravelPayload, null, 2))}>Preset 1: Standard Trip</button>
+                        <button className="preset-btn" onClick={() => setJsonInput(JSON.stringify(sampleTravelPayloadAnomalies, null, 2))}>Preset 2: Travel with Anomaly</button>
+                      </div>
                     </div>
-                    {sapFile && <button type="submit" className="btn btn-primary" style={{ width: '100%' }} disabled={loading}>Process SAP Export</button>}
-                  </form>
 
-                  {/* Utility uploader */}
-                  <form onSubmit={handleUploadUtility} style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '16px' }}>
-                    <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--scope2)' }}>SOURCE B: ELECTRICITY UTILITY BILL CSV</div>
-                    <div className="dropzone" style={{ position: 'relative' }}>
-                      <input 
-                        type="file" 
-                        accept=".csv"
-                        onChange={(e) => setUtilityFile(e.target.files[0])}
-                        style={{ position: 'absolute', opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }}
-                      />
-                      <span className="dropzone-icon">⚡</span>
-                      <div className="dropzone-text">{utilityFile ? utilityFile.name : "Select or drag Utility Billing CSV file"}</div>
-                      <div className="dropzone-subtext">Must contain Bill Start Date, Bill End Date, Consumption, Account Number</div>
-                    </div>
-                    {utilityFile && <button type="submit" className="btn btn-primary" style={{ width: '100%' }} disabled={loading}>Process Utility Bill</button>}
-                  </form>
-
-                  {/* Sample content generator */}
-                  <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                    <div className="detail-label">Need Test Files?</div>
-                    <div className="sample-downloader">
-                      <span>SAP Fuel Sample Export (with anomalies)</span>
-                      <a href="#" className="link-action" onClick={(e) => { e.preventDefault(); downloadCSV('sap'); }}>Download CSV</a>
-                    </div>
-                    <div className="sample-downloader">
-                      <span>Utility billing calendar-spanning sample</span>
-                      <a href="#" className="link-action" onClick={(e) => { e.preventDefault(); downloadCSV('utility'); }}>Download CSV</a>
-                    </div>
+                    <button className="btn btn-accent" style={{ marginTop: 'auto' }} onClick={handleSubmitTravel} disabled={loading}>
+                      📥 Push JSON to Travel Ingestion API
+                    </button>
                   </div>
                 </div>
 
-                {/* API Console Simulator */}
-                <div className="upload-card">
-                  <div className="chart-title">
-                    <h2>Corporate Travel API Simulator</h2>
-                    <p>Copy-paste JSON expense records for Concur or Navan API ingestion</p>
-                  </div>
-                  
-                  <div className="card-instructions">
-                    Travel platform items map flights, hotel stays, and ground transport. Flight distances are dynamically calculated using **Haversine formula coordinate math** for airport codes.
-                  </div>
-
-                  <div className="console-container">
-                    <textarea 
-                      className="console-editor"
-                      value={jsonInput}
-                      onChange={(e) => setJsonInput(e.target.value)}
-                    />
-                    <div className="console-presets">
-                      <button className="preset-btn" onClick={() => setJsonInput(JSON.stringify(sampleTravelPayload, null, 2))}>Preset 1: Standard Trip</button>
-                      <button className="preset-btn" onClick={() => setJsonInput(JSON.stringify(sampleTravelPayloadAnomalies, null, 2))}>Preset 2: Travel with Anomaly</button>
+                {/* Staging Sandbox & Diagnostics */}
+                <div className="upload-card" style={{ maxWidth: '100%' }}>
+                  <div className="chart-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <h2>Ingestion Sandbox & Validation Diagnostics</h2>
+                      <p>Staging area for malformed raw rows that failed ingestion schema constraints</p>
                     </div>
+                    <span className="sandbox-badge" style={{ backgroundColor: failedRecords.length > 0 ? 'var(--status-suspicious-bg)' : 'var(--status-approved-bg)', color: failedRecords.length > 0 ? 'var(--status-suspicious)' : 'var(--status-approved)' }}>
+                      {failedRecords.length} Sandboxed Rows
+                    </span>
                   </div>
 
-                  <button className="btn btn-accent" style={{ marginTop: 'auto' }} onClick={handleSubmitTravel} disabled={loading}>
-                    📥 Push JSON to Travel Ingestion API
-                  </button>
+                  <div className="card-instructions">
+                    Correct data constraints errors (such as text instead of numeric consumption, empty dates, or bad layout formats) directly below. Hit <strong>"Retry Normalization"</strong> to safely parse and ingest correct items.
+                  </div>
+
+                  {failedRecords.length === 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px', gap: '12px', border: '1px dashed var(--border-subtle)', borderRadius: '8px', backgroundColor: 'rgba(255,255,255,0.01)' }}>
+                      <span style={{ fontSize: '24px' }}>🛡️</span>
+                      <span style={{ fontSize: '13px', fontWeight: '500', color: 'var(--text-secondary)' }}>All Ingestion flows clean. No sandbox errors flagged!</span>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'grid', gridTemplateColumns: selectedFailedRecord ? '1fr 1fr' : '1fr', gap: '24px' }}>
+                      {/* Sandbox List */}
+                      <div className="sandbox-grid">
+                        {failedRecords.map(raw => (
+                          <div 
+                            key={raw.id} 
+                            className="sandbox-row" 
+                            style={{ 
+                              cursor: 'pointer', 
+                              border: selectedFailedRecord?.id === raw.id ? '1px solid var(--status-suspicious)' : '1px solid var(--border-subtle)',
+                              backgroundColor: selectedFailedRecord?.id === raw.id ? 'rgba(244, 63, 94, 0.03)' : 'var(--bg-surface-elevated)'
+                            }}
+                            onClick={() => {
+                              setSelectedFailedRecord(raw);
+                              setFailedRecordCorrectionData(raw.raw_data);
+                            }}
+                          >
+                            <div style={{ flexGrow: 1 }}>
+                              <div style={{ fontWeight: '600', fontSize: '14px' }}>Row #{raw.row_index} in Batch #{raw.batch} ({raw.raw_data.TXT50 || raw.raw_data['Utility Account'] || "Raw Ingest Record"})</div>
+                              <div className="sandbox-error-text">❌ {raw.validation_errors.join('; ')}</div>
+                            </div>
+                            <span style={{ fontSize: '12px', color: 'var(--text-muted)', marginLeft: '12px' }}>Click to Fix ➔</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Inline Form */}
+                      {selectedFailedRecord && (
+                        <form onSubmit={handleRetrySandboxSubmit} className="sandbox-form">
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span className="form-title" style={{ color: 'var(--status-suspicious)', fontWeight: '600' }}>✏️ Correct Sandbox Line (Row #{selectedFailedRecord.row_index})</span>
+                            <button type="button" className="close-btn" style={{ fontSize: '16px' }} onClick={() => setSelectedFailedRecord(null)}>✕</button>
+                          </div>
+                          
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', maxHeight: '250px', overflowY: 'auto', paddingRight: '4px' }}>
+                            {Object.keys(selectedFailedRecord.raw_data).map(key => (
+                              <div className="form-group" key={key}>
+                                <label className="form-label">{key}</label>
+                                <input 
+                                  type="text" 
+                                  className="form-input" 
+                                  value={failedRecordCorrectionData[key] || ''}
+                                  onChange={(e) => {
+                                    setFailedRecordCorrectionData({
+                                      ...failedRecordCorrectionData,
+                                      [key]: e.target.value
+                                    });
+                                  }}
+                                  required
+                                />
+                              </div>
+                            ))}
+                          </div>
+
+                          <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
+                            <button type="submit" className="btn btn-primary" style={{ flexGrow: 1, backgroundColor: 'var(--status-suspicious)', borderColor: 'var(--status-suspicious)' }} disabled={loading}>
+                              {loading ? "Re-processing..." : "⚡ Retry Normalization"}
+                            </button>
+                            <button type="button" className="btn btn-secondary" onClick={() => setSelectedFailedRecord(null)}>
+                              Cancel
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -836,8 +1046,72 @@ export default function App() {
                 <div className="suspicious-box">
                   <span className="suspicious-box-title">Validation Warning / Anomaly Flags</span>
                   <span className="suspicious-box-desc">{selectedRecord.suspicious_reason}</span>
+                  {selectedRecord.suspicious_reason.includes("Unknown Plant Code") && !showPlantRegisterForm && (
+                    <button 
+                      className="btn btn-accent" 
+                      style={{ marginTop: '12px', width: '100%', fontSize: '12px', padding: '6px 12px' }}
+                      onClick={() => {
+                        const match = selectedRecord.suspicious_reason.match(/Unknown Plant Code '([^']+)'/);
+                        const plantCode = match ? match[1] : "";
+                        setPlantCodeToRegister(plantCode);
+                        setShowPlantRegisterForm(true);
+                      }}
+                    >
+                      🚀 Register Plant Mappings & Re-calculate
+                    </button>
+                  )}
                 </div>
               )}
+
+              {/* Plant Registration Wizard form */}
+              {showPlantRegisterForm && (
+                <form onSubmit={handleRegisterPlantSubmit} className="correction-form" style={{ border: '1px solid var(--status-approved)' }}>
+                  <div className="form-title" style={{ color: 'var(--status-approved)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>🌱 Register Facility Mappings</span>
+                    <button type="button" className="close-btn" style={{ fontSize: '16px' }} onClick={() => setShowPlantRegisterForm(false)}>✕</button>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Plant Code (WERKS)</label>
+                    <input 
+                      type="text" 
+                      className="form-input" 
+                      value={plantCodeToRegister}
+                      onChange={(e) => setPlantCodeToRegister(e.target.value)}
+                      readOnly
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Resolve Facility Name</label>
+                    <input 
+                      type="text" 
+                      className="form-input" 
+                      placeholder="e.g. Munich Hub Center"
+                      value={newPlantName}
+                      onChange={(e) => setNewPlantName(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Regional Electricity Grid (Factor Country)</label>
+                    <select 
+                      className="form-input"
+                      style={{ width: '100%' }}
+                      value={newPlantRegion}
+                      onChange={(e) => setNewPlantRegion(e.target.value)}
+                    >
+                      <option value="DE">Germany (DE) - 0.38 kg/kWh</option>
+                      <option value="US">United States (US) - 0.37 kg/kWh</option>
+                      <option value="IN">India (IN) - 0.71 kg/kWh</option>
+                      <option value="UK">United Kingdom (UK) - 0.21 kg/kWh</option>
+                      <option value="DEFAULT">Global Average - 0.40 kg/kWh</option>
+                    </select>
+                  </div>
+                  <button type="submit" className="btn btn-primary" style={{ backgroundColor: 'var(--status-approved)', width: '100%' }} disabled={loading}>
+                    {loading ? "Processing..." : "💾 Register & Retroactive Sync"}
+                  </button>
+                </form>
+              )}
+
 
               {/* Emissions Math */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
@@ -940,9 +1214,20 @@ export default function App() {
                           <span className="timeline-time">{h.timestamp.substring(11, 16)} {h.timestamp.substring(0, 10)}</span>
                           {h.comment && <span className="timeline-comment">"{h.comment}"</span>}
                           {h.changes && Object.keys(h.changes).length > 0 && (
-                            <span className="timeline-changes">
-                              Changes: {JSON.stringify(h.changes)}
-                            </span>
+                            <div className="timeline-changes" style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontFamily: 'var(--font-sans)', fontSize: '12px', marginTop: '6px' }}>
+                              {Object.keys(h.changes).map(field => {
+                                const change = h.changes[field];
+                                if (!change || change.old === undefined || change.new === undefined) return null;
+                                return (
+                                  <div key={field} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                    <span style={{ fontWeight: '600', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{field.replace('_', ' ')}:</span>
+                                    <span className="diff-tag-del">{typeof change.old === 'number' ? Math.round(change.old).toLocaleString() : String(change.old)}</span>
+                                    <span style={{ color: 'var(--text-muted)' }}>→</span>
+                                    <span className="diff-tag-ins">{typeof change.new === 'number' ? Math.round(change.new).toLocaleString() : String(change.new)}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           )}
                         </div>
                       </div>

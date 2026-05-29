@@ -1048,3 +1048,99 @@ body {
 .empty-state-icon {
   font-size: 48px;
 }
+
+/* Optimizations UI Enhancements */
+.sandbox-badge {
+  background-color: var(--status-suspicious-bg);
+  color: var(--status-suspicious);
+  border: 1px solid rgba(244, 63, 94, 0.2);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.diff-tag-del {
+  background-color: rgba(244, 63, 94, 0.15);
+  color: #fb7185;
+  text-decoration: line-through;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+}
+
+.diff-tag-ins {
+  background-color: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+}
+
+.scorecard-circle {
+  position: relative;
+  width: 90px;
+  height: 90px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.scorecard-circle::before {
+  content: '';
+  position: absolute;
+  width: 74px;
+  height: 74px;
+  border-radius: 50%;
+  background-color: var(--bg-surface);
+}
+
+.scorecard-value {
+  position: relative;
+  z-index: 2;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.sandbox-form {
+  background-color: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 24px;
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sandbox-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.sandbox-row {
+  background-color: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: var(--transition-smooth);
+}
+
+.sandbox-row:hover {
+  border-color: var(--status-suspicious);
+}
+
+.sandbox-error-text {
+  color: var(--status-suspicious);
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 4px;
+}
+

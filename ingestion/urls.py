@@ -3,7 +3,8 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     OrganizationViewSet, PlantLookupViewSet, IngestionSourceViewSet, 
     IngestionBatchViewSet, NormalizedEmissionRecordViewSet, 
-    FileUploadView, TravelIngestionView, DashboardAnalyticsView, SeedDatabaseView
+    FileUploadView, TravelIngestionView, DashboardAnalyticsView, SeedDatabaseView,
+    RawIngestedRecordViewSet
 )
 
 router = DefaultRouter()
@@ -12,6 +13,7 @@ router.register('plants', PlantLookupViewSet)
 router.register('sources', IngestionSourceViewSet)
 router.register('batches', IngestionBatchViewSet)
 router.register('records', NormalizedEmissionRecordViewSet)
+router.register('raw-records', RawIngestedRecordViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),

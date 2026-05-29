@@ -155,3 +155,91 @@ class CarbonAccountingTests(TestCase):
         recs_b = NormalizedEmissionRecord.objects.filter(organization=self.org_b)
         self.assertEqual(recs_b.count(), 1)
         self.assertEqual(recs_b.first().description, "B-Fuel")
+
+    def test_retroactive_plant_recalculation(self):
+        """Test registering an unknown plant dynamically updates suspicious records and clears warning."""
+        batch = IngestionBatch.objects.create(
+            organization=self.org_a,
+            source=self.sap_source,
+            filename="sap_errors.csv",
+            status="PROCESSING"
+        )
+        raw = RawIngestedRecord.objects.create(
+            batch=batch,
+            row_index=1,
+            raw_data={"WERKS": "9999", "BUDAT": "20260420", "MENGE": "1000", "MEINS": "L", "TXT50": "DIESEL FUEL"}
+        )
+        
+        process_sap_batch(batch)
+        
+        rec = NormalizedEmissionRecord.objects.filter(batch=batch).first()
+        self.assertEqual(rec.status, "SUSPICIOUS")
+        self.assertIn("Unknown Plant Code '9999'", rec.suspicious_reason)
+        
+        # Now register the plant via standard Django or test lookup creation
+        PlantLookup.objects.create(organization=self.org_a, plant_code="9999", name="Berlin Gigafactory", region="DE")
+        
+        # Call the recalculate action via POST or direct function call in Views
+        from django.test import RequestFactory
+        from .views import NormalizedEmissionRecordViewSet
+        
+        factory = RequestFactory()
+        request = factory.post('/api/v1/records/recalculate_for_plant/', {
+            'plant_code': '9999',
+            'organization': self.org_a.id
+        }, content_type='application/json')
+        
+        view = NormalizedEmissionRecordViewSet.as_view({'post': 'recalculate_for_plant'})
+        response = view(request)
+        
+        self.assertEqual(response.status_code, 200)
+        
+        # Fetch updated record
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "DRAFT")
+        self.assertIsNone(rec.suspicious_reason)
+        self.assertIn("Berlin Gigafactory", rec.description)
+
+    def test_staging_sandbox_validation_retry(self):
+        """Test correcting a malformed CSV record staged in RawIngestedRecord and retrying via sandbox endpoint."""
+        batch = IngestionBatch.objects.create(
+            organization=self.org_a,
+            source=self.sap_source,
+            filename="malformed.csv",
+            status="PROCESSING",
+            summary={"parsed": 1, "failed": 1, "normalized": 0, "suspicious": 0}
+        )
+        # Seed record that failed validation because quantity was negative
+        raw = RawIngestedRecord.objects.create(
+            batch=batch,
+            row_index=1,
+            raw_data={"WERKS": "1000", "BUDAT": "20260420", "MENGE": "-500", "MEINS": "L", "TXT50": "DIESEL"},
+            validation_errors=["Quantity must be positive"],
+            status="FAILED_VALIDATION"
+        )
+        
+        # Try view retry action
+        from django.test import RequestFactory
+        from .views import RawIngestedRecordViewSet
+        
+        factory = RequestFactory()
+        # Correct the quantity to positive 1500
+        request = factory.post(f'/api/v1/raw-records/{raw.id}/retry_ingest/', {
+            'raw_data': {"WERKS": "1000", "BUDAT": "20260420", "MENGE": "1500", "MEINS": "L", "TXT50": "DIESEL"}
+        }, content_type='application/json')
+        
+        view = RawIngestedRecordViewSet.as_view({'post': 'retry_ingest'})
+        response = view(request, pk=raw.id)
+        
+        self.assertEqual(response.status_code, 200)
+        
+        raw.refresh_from_db()
+        self.assertEqual(raw.status, "NORMALIZED")
+        self.assertEqual(raw.validation_errors, [])
+        
+        # Check that NormalizedEmissionRecord is created
+        norm_rec = NormalizedEmissionRecord.objects.filter(raw_record=raw).first()
+        self.assertIsNotNone(norm_rec)
+        self.assertEqual(norm_rec.raw_quantity, 1500.0)
+        self.assertEqual(norm_rec.status, "DRAFT")
+

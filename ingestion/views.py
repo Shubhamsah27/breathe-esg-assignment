@@ -240,6 +240,78 @@ class NormalizedEmissionRecordViewSet(viewsets.ModelViewSet):
             
         return Response(NormalizedEmissionRecordSerializer(record).data)
 
+    @action(detail=False, methods=['post'])
+    def recalculate_for_plant(self, request):
+        plant_code = request.data.get('plant_code')
+        org_id = request.data.get('organization')
+        
+        if not plant_code or not org_id:
+            return Response({"error": "Missing plant_code or organization parameter."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        org = get_object_or_404(Organization, id=org_id)
+        plant = PlantLookup.objects.filter(organization=org, plant_code=plant_code).first()
+        if not plant:
+            return Response({"error": f"Plant with code {plant_code} is not registered yet."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        from django.db.models import Q
+        records = NormalizedEmissionRecord.objects.filter(
+            organization=org,
+            status='SUSPICIOUS',
+            audit_locked=False
+        ).filter(
+            Q(description__contains=f"Plant {plant_code}") | 
+            Q(suspicious_reason__contains=f"Unknown Plant Code '{plant_code}'")
+        )
+        
+        updated_count = 0
+        for rec in records:
+            raw = rec.raw_record
+            if not raw or not raw.raw_data:
+                continue
+            
+            qty = rec.raw_quantity
+            unit_raw = rec.raw_unit
+            desc_raw = raw.raw_data.get('TXT50', '')
+            
+            from .parsers import normalize_sap_unit, get_sap_fuel_type, EMISSION_FACTORS
+            conversion_factor, norm_unit = normalize_sap_unit(unit_raw, desc_raw)
+            norm_qty = qty * conversion_factor
+            
+            fuel_type = get_sap_fuel_type(desc_raw)
+            # Recalculate co2e if any factor depends on plant, or just clear the plant warning.
+            # In SAP Fuel, emissions are independent of region, but unknown plant causes suspension.
+            # We resolve plant name in description.
+            
+            reasons = rec.suspicious_reason.split('; ') if rec.suspicious_reason else []
+            reasons = [r for r in reasons if f"Unknown Plant Code '{plant_code}'" not in r and f"Unknown Plant ({plant_code})" not in r]
+            
+            rec.description = rec.description.replace(f"Unknown Plant ({plant_code})", plant.name)
+            rec.description = rec.description.replace(f"Plant {plant_code} (Unknown Plant ({plant_code}))", f"Plant {plant_code} ({plant.name})")
+            
+            if reasons:
+                rec.suspicious_reason = '; '.join(reasons)
+                rec.status = 'SUSPICIOUS'
+            else:
+                rec.suspicious_reason = None
+                rec.status = 'DRAFT'
+                
+            rec.save()
+            
+            AuditLog.objects.create(
+                organization=org,
+                record=rec,
+                action='EDIT',
+                changes={
+                    "status": {"old": "SUSPICIOUS", "new": rec.status},
+                    "description": {"new": rec.description}
+                },
+                comment=f"Plant code '{plant_code}' registered as '{plant.name}' ({plant.region}). Warning cleared."
+            )
+            updated_count += 1
+            
+        return Response({"message": f"Successfully updated {updated_count} records for plant {plant_code}."})
+
+
 class FileUploadView(APIView):
     @method_decorator(csrf_exempt)
     def post(self, request):
@@ -435,3 +507,229 @@ class SeedDatabaseView(APIView):
                 "TRAVEL": travel_source.id
             }
         })
+
+
+class RawIngestedRecordViewSet(viewsets.ModelViewSet):
+    queryset = RawIngestedRecord.objects.all()
+    serializer_class = RawIngestedRecordSerializer
+    
+    def get_queryset(self):
+        queryset = self.queryset
+        org_id = self.request.query_params.get('organization')
+        rec_status = self.request.query_params.get('status')
+        
+        if org_id:
+            queryset = queryset.filter(batch__organization_id=org_id)
+        if rec_status:
+            queryset = queryset.filter(status=rec_status)
+            
+        return queryset
+        
+    @action(detail=True, methods=['post'])
+    def retry_ingest(self, request, pk=None):
+        raw_rec = self.get_object()
+        if raw_rec.status != 'FAILED_VALIDATION':
+            return Response({"error": "Only failed validation records can be retried."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        corrected_data = request.data.get('raw_data', {})
+        if not corrected_data:
+            return Response({"error": "No corrected raw_data provided."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        raw_rec.raw_data = corrected_data
+        raw_rec.validation_errors = []
+        raw_rec.status = 'PENDING'
+        raw_rec.save()
+        
+        batch = raw_rec.batch
+        source_type = batch.source.source_type
+        
+        try:
+            from .parsers import (
+                parse_sap_date, clean_sap_quantity, normalize_sap_unit, get_sap_fuel_type, EMISSION_FACTORS,
+                parse_utility_date, normalize_utility_unit, calculate_haversine_distance
+            )
+            
+            if source_type == 'SAP':
+                data = raw_rec.raw_data
+                errors = []
+                required_cols = ['WERKS', 'BUDAT', 'MENGE', 'MEINS', 'TXT50']
+                missing_cols = [col for col in required_cols if col not in data]
+                if missing_cols:
+                    raise Exception(f"Missing columns: {', '.join(missing_cols)}")
+                    
+                plant_code = str(data['WERKS']).strip()
+                date_raw = data['BUDAT']
+                qty_raw = data['MENGE']
+                unit_raw = data['MEINS']
+                desc_raw = data['TXT50']
+                
+                act_date = parse_sap_date(date_raw)
+                if not act_date:
+                    errors.append(f"Invalid date format: {date_raw}")
+                qty = clean_sap_quantity(qty_raw)
+                if qty <= 0:
+                    errors.append(f"Quantity must be positive: {qty_raw}")
+                    
+                if errors:
+                    raise Exception('; '.join(errors))
+                    
+                plant = PlantLookup.objects.filter(organization=batch.organization, plant_code=plant_code).first()
+                is_suspicious = False
+                susp_reasons = []
+                if not plant:
+                    is_suspicious = True
+                    susp_reasons.append(f"Unknown Plant Code '{plant_code}'. Ingestion defaulted to Global standards.")
+                    plant_name = f"Unknown Plant ({plant_code})"
+                else:
+                    plant_name = plant.name
+                    
+                conversion_factor, norm_unit = normalize_sap_unit(unit_raw, desc_raw)
+                norm_qty = qty * conversion_factor
+                fuel_type = get_sap_fuel_type(desc_raw)
+                co2e = norm_qty * EMISSION_FACTORS[fuel_type]['factor']
+                
+                if norm_qty > 100000.0:
+                    is_suspicious = True
+                    susp_reasons.append(f"Extremely high fuel consumption volume detected: {norm_qty} {norm_unit}")
+                    
+                rec = NormalizedEmissionRecord.objects.create(
+                    organization=batch.organization,
+                    batch=batch,
+                    raw_record=raw_rec,
+                    activity_type='SAP_FUEL',
+                    scope='Scope 1',
+                    category='Stationary Combustion' if fuel_type in ['HEIZOEL', 'NATURAL_GAS'] else 'Mobile Combustion',
+                    activity_date=act_date,
+                    description=f"SAP Ingestion - Plant {plant_code} ({plant_name}) - {desc_raw}",
+                    raw_quantity=qty,
+                    raw_unit=unit_raw,
+                    normalized_quantity=norm_qty,
+                    normalized_unit=norm_unit,
+                    co2e_kg=co2e,
+                    status='SUSPICIOUS' if is_suspicious else 'DRAFT',
+                    suspicious_reason='; '.join(susp_reasons) if is_suspicious else None
+                )
+                
+                AuditLog.objects.create(
+                    organization=batch.organization,
+                    record=rec,
+                    action='INGEST',
+                    comment=f"Ingested via Sandbox Retry from batch {batch.id}."
+                )
+                
+            elif source_type == 'UTILITY':
+                data = raw_rec.raw_data
+                errors = []
+                required_cols = ['Utility Account', 'Meter Number', 'Bill Start Date', 'Bill End Date', 'Consumption', 'Unit']
+                missing_cols = [col for col in required_cols if col not in data]
+                if missing_cols:
+                    raise Exception(f"Missing columns: {', '.join(missing_cols)}")
+                    
+                account = data['Utility Account']
+                meter = data['Meter Number']
+                start_raw = data['Bill Start Date']
+                end_raw = data['Bill End Date']
+                qty_raw = data['Consumption']
+                unit_raw = data['Unit']
+                region_code = data.get('Region', 'US')
+                
+                start_date = parse_utility_date(start_raw)
+                end_date = parse_utility_date(end_raw)
+                if not start_date or not end_date:
+                    errors.append(f"Invalid dates: Start={start_raw}, End={end_raw}")
+                elif end_date <= start_date:
+                    errors.append(f"Billing end date ({end_raw}) must be after start date ({start_raw})")
+                    
+                try:
+                    qty = float(qty_raw)
+                    if qty <= 0:
+                        errors.append(f"Consumption must be positive: {qty_raw}")
+                except ValueError:
+                    errors.append(f"Invalid consumption number: {qty_raw}")
+                    
+                if errors:
+                    raise Exception('; '.join(errors))
+                    
+                norm_qty_total, norm_unit = normalize_utility_unit(qty, unit_raw)
+                ef = EMISSION_FACTORS['GRID_ELECTRICITY'].get(region_code, EMISSION_FACTORS['GRID_ELECTRICITY']['DEFAULT'])
+                
+                days_total = (end_date - start_date).days
+                daily_average = norm_qty_total / days_total
+                
+                from datetime import timedelta, datetime
+                month_day_counts = {}
+                curr_date = start_date
+                while curr_date < end_date:
+                    key = (curr_date.year, curr_date.month)
+                    month_day_counts[key] = month_day_counts.get(key, 0) + 1
+                    curr_date += timedelta(days=1)
+                    
+                is_suspicious_total = False
+                susp_reasons = []
+                if norm_qty_total > 500000.0:
+                    is_suspicious_total = True
+                    susp_reasons.append(f"Extremely high utility billing consumption: {norm_qty_total} kWh")
+                if days_total > 45:
+                    is_suspicious_total = True
+                    susp_reasons.append(f"Billing period is abnormally long ({days_total} days).")
+                    
+                for (yr, mn), days_in_month in month_day_counts.items():
+                    prorated_qty = daily_average * days_in_month
+                    prorated_co2e = prorated_qty * ef
+                    month_name = datetime(yr, mn, 1).strftime('%B %Y')
+                    
+                    from datetime import date
+                    if mn == end_date.month and yr == end_date.year:
+                        record_date = end_date
+                    else:
+                        record_date = date(yr, mn, 28)
+                        
+                    rec = NormalizedEmissionRecord.objects.create(
+                        organization=batch.organization,
+                        batch=batch,
+                        raw_record=raw_rec,
+                        activity_type='UTILITY_ELECTRICITY',
+                        scope='Scope 2',
+                        category='Purchased Electricity',
+                        activity_date=record_date,
+                        description=f"Electricity - Account {account}, Meter {meter} - Prorated for {month_name} ({days_in_month}/{days_total} days) [Retry]",
+                        raw_quantity=qty * (days_in_month / days_total),
+                        raw_unit=unit_raw,
+                        normalized_quantity=prorated_qty,
+                        normalized_unit=norm_unit,
+                        co2e_kg=prorated_co2e,
+                        status='SUSPICIOUS' if is_suspicious_total else 'DRAFT',
+                        suspicious_reason='; '.join(susp_reasons) if is_suspicious_total else None
+                    )
+                    
+                    AuditLog.objects.create(
+                        organization=batch.organization,
+                        record=rec,
+                        action='INGEST',
+                        comment=f"Ingested via Sandbox Retry."
+                    )
+            else:
+                raise Exception(f"Ingestion sandbox retry is not supported for travel API JSON.")
+                
+            raw_rec.status = 'NORMALIZED'
+            raw_rec.validation_errors = []
+            raw_rec.save()
+            
+            summary = batch.summary
+            summary['normalized'] = summary.get('normalized', 0) + 1
+            if summary.get('failed', 0) > 0:
+                summary['failed'] = summary['failed'] - 1
+            batch.summary = summary
+            batch.save()
+            
+            return Response({
+                "message": "Raw record normalized successfully.",
+                "raw_record": RawIngestedRecordSerializer(raw_rec).data
+            })
+            
+        except Exception as e:
+            raw_rec.status = 'FAILED_VALIDATION'
+            raw_rec.validation_errors = [str(e)]
+            raw_rec.save()
+            return Response({"error": f"Failed retry normalization: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
