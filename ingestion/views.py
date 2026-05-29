@@ -458,6 +458,7 @@ class DashboardAnalyticsView(APIView):
         })
 
 class SeedDatabaseView(APIView):
+    @method_decorator(csrf_exempt)
     def post(self, request):
         """Creates dummy data, lookups, and users to bootstrap review dashboard instantly."""
         # 1. Create Default Organization
