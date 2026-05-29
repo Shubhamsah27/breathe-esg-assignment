@@ -5,7 +5,7 @@ let tempApiBase = import.meta.env.VITE_API_BASE || '';
 
 // Intelligent production auto-detection for Render deployments
 if (typeof window !== 'undefined' && window.location.hostname.includes('onrender.com')) {
-  if (!tempApiBase || tempApiBase.includes('localhost') || tempApiBase.includes('127.0.0.1')) {
+  if (!tempApiBase || tempApiBase.includes('localhost') || !tempApiBase.includes('.') || tempApiBase.includes('breathe-esg-backend')) {
     tempApiBase = 'https://breathe-esg-backend-u610.onrender.com/api/v1';
   }
 }
