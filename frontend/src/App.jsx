@@ -1,7 +1,20 @@
 import React, { useState, useEffect } from 'react';
 
 // Common global API base
-let tempApiBase = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api/v1';
+let tempApiBase = import.meta.env.VITE_API_BASE || '';
+
+// Intelligent production auto-detection for Render deployments
+if (typeof window !== 'undefined' && window.location.hostname.includes('onrender.com')) {
+  if (!tempApiBase || tempApiBase.includes('localhost') || tempApiBase.includes('127.0.0.1')) {
+    tempApiBase = 'https://breathe-esg-backend-u610.onrender.com/api/v1';
+  }
+}
+
+// Fallback to local default if still empty
+if (!tempApiBase) {
+  tempApiBase = 'http://localhost:8000/api/v1';
+}
+
 if (tempApiBase && !tempApiBase.startsWith('http://') && !tempApiBase.startsWith('https://')) {
   tempApiBase = `https://${tempApiBase}/api/v1`;
 }
